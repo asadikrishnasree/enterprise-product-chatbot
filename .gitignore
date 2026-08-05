@@ -1,0 +1,30 @@
+# macOS
+.DS_Store
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Dependencies
+node_modules/
+backend/node_modules/
+frontend/node_modules/
+
+# Build output
+dist/
+backend/dist/
+frontend/dist/
+
+# Vite
+.vite/
+
+# Test output
+coverage/
+
+# Local Chroma database
+chroma-data/
+
+# Logs
+*.log
+npm-debug.log*

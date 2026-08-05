@@ -1,0 +1,39 @@
+services:
+  chroma:
+    image: chromadb/chroma:latest
+    container_name: enterprise-chatbot-chroma
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./chroma-data:/data
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+    container_name: enterprise-chatbot-backend
+    ports:
+      - "3001:3001"
+    env_file:
+      - ./backend/.env
+    environment:
+      PORT: 3001
+      FRONTEND_URL: http://localhost:8080
+      CHROMA_HOST: chroma
+      CHROMA_PORT: 8000
+      KNOWLEDGE_BASE_PATH: /knowledge-base
+    volumes:
+      - ./knowledge-base:/knowledge-base:ro
+    depends_on:
+      - chroma
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: enterprise-chatbot-frontend
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
