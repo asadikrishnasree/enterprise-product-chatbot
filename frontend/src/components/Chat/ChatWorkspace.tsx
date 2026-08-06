@@ -67,7 +67,9 @@ function ChatWorkspace() {
     (state) =>
       state.conversation.conversations,
   );
-
+  const selectedModel = useAppSelector(
+    (state) => state.model.selectedModel,
+  );
   const activeConversationId =
     useAppSelector(
       (state) =>
@@ -231,7 +233,7 @@ function ChatWorkspace() {
            * The current streaming backend supports
            * only the real OpenAI provider.
            */
-          model: "openai",
+          model: selectedModel,
 
           knowledgeBaseId: "default",
 

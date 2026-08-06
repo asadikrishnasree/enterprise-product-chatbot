@@ -1,3 +1,7 @@
+import type {
+  ModelProvider,
+} from "../redux/slices/modelSlice";
+
 export type StreamChatMessage = {
     role: "user" | "assistant";
     content: string;
@@ -19,7 +23,7 @@ export type StreamChatMessage = {
   };
   
   export type StreamChatRequest = {
-    model: "openai";
+    model: ModelProvider;
     knowledgeBaseId: string;
     messages: StreamChatMessage[];
     systemPrompt?: string;

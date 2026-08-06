@@ -11,14 +11,19 @@ import {
   retrieveRelevantChunks,
 } from "../services/retrieval/retrievalService.js";
 
-import type {
-  ChatRequest,
-  ChatResponse,
-} from "../types/chat.js";
-
 import {
   streamOpenAIResponse,
 } from "../services/llm/streaming/openAIStreamingService.js";
+
+import {
+  streamMockResponse,
+} from "../services/llm/streaming/mockStreamingService.js";
+
+import type {
+  ChatRequest,
+  ChatResponse,
+  ModelProvider,
+} from "../types/chat.js";
 
 type ChatErrorResponse = {
   error: {
@@ -26,19 +31,46 @@ type ChatErrorResponse = {
     message: string;
   };
 };
+
+type RetrievedChunks = Awaited<
+  ReturnType<typeof retrieveRelevantChunks>
+>;
+
+const DEFAULT_SYSTEM_PROMPT =
+  "Answer only using the supplied product documentation. " +
+  "If the answer is not supported by the context, clearly say " +
+  "that it was not found in the knowledge base.";
+
+const NOT_FOUND_MESSAGE =
+  "I couldn't find that information in the product knowledge base.";
+
+const supportedProviders: ModelProvider[] = [
+  "openai",
+  "claude",
+  "gemini",
+];
+
+const isSupportedProvider = (
+  provider: unknown,
+): provider is ModelProvider =>
+  typeof provider === "string" &&
+  supportedProviders.includes(
+    provider as ModelProvider,
+  );
+
 const sendSseEvent = (
   response: Response,
   eventName: string,
   data: unknown,
 ): void => {
   response.write(
-    `event: ${eventName}\ndata: ${JSON.stringify(data)}\n\n`,
+    `event: ${eventName}\n` +
+      `data: ${JSON.stringify(data)}\n\n`,
   );
 };
+
 const buildKnowledgeContext = (
-  chunks: Awaited<
-    ReturnType<typeof retrieveRelevantChunks>
-  >,
+  chunks: RetrievedChunks,
 ): string =>
   chunks
     .map(
@@ -52,6 +84,167 @@ const buildKnowledgeContext = (
     )
     .join("\n\n---\n\n");
 
+const buildMockRetrievedContent = (
+  chunks: RetrievedChunks,
+): string =>
+  chunks
+    .slice(0, 3)
+    .map(
+      (chunk, index) =>
+        [
+          `Source ${index + 1}: ${chunk.source}`,
+          chunk.section
+            ? `Section: ${chunk.section}`
+            : null,
+          chunk.content,
+        ]
+          .filter(
+            (
+              value,
+            ): value is string =>
+              Boolean(value),
+          )
+          .join("\n"),
+    )
+    .join("\n\n");
+
+const mapSourceChunks = (
+  chunks: RetrievedChunks,
+) =>
+  chunks.map((chunk) => ({
+    id: chunk.id,
+    source: chunk.source,
+    content: chunk.content,
+    score: chunk.score,
+  }));
+
+const findLatestUserMessage = (
+  messages: ChatRequest["messages"],
+) =>
+  [...messages]
+    .reverse()
+    .find(
+      (message) =>
+        message.role === "user",
+    );
+
+const validateChatRequest = (
+  requestBody: ChatRequest,
+):
+  | {
+      valid: true;
+      model: ModelProvider;
+      latestUserMessage: {
+        role: "user";
+        content: string;
+      };
+    }
+  | {
+      valid: false;
+      status: number;
+      error: ChatErrorResponse;
+    } => {
+  const {
+    model,
+    messages,
+    knowledgeBaseId,
+  } = requestBody;
+
+  if (!model) {
+    return {
+      valid: false,
+      status: 400,
+      error: {
+        error: {
+          code: "MODEL_REQUIRED",
+          message:
+            "A model provider is required.",
+        },
+      },
+    };
+  }
+
+  if (!isSupportedProvider(model)) {
+    return {
+      valid: false,
+      status: 400,
+      error: {
+        error: {
+          code: "MODEL_NOT_SUPPORTED",
+          message:
+            "Supported providers are openai, claude, and gemini.",
+        },
+      },
+    };
+  }
+
+  if (
+    !Array.isArray(messages) ||
+    messages.length === 0
+  ) {
+    return {
+      valid: false,
+      status: 400,
+      error: {
+        error: {
+          code: "MESSAGES_REQUIRED",
+          message:
+            "At least one conversation message is required.",
+        },
+      },
+    };
+  }
+
+  if (!knowledgeBaseId) {
+    return {
+      valid: false,
+      status: 400,
+      error: {
+        error: {
+          code:
+            "KNOWLEDGE_BASE_REQUIRED",
+          message:
+            "A knowledge base ID is required.",
+        },
+      },
+    };
+  }
+
+  const latestUserMessage =
+    findLatestUserMessage(messages);
+
+  if (!latestUserMessage) {
+    return {
+      valid: false,
+      status: 400,
+      error: {
+        error: {
+          code:
+            "USER_MESSAGE_REQUIRED",
+          message:
+            "A user message is required.",
+        },
+      },
+    };
+  }
+
+  return {
+    valid: true,
+    model,
+    latestUserMessage: {
+      role: "user",
+      content:
+        latestUserMessage.content,
+    },
+  };
+};
+
+/*
+ * Non-streaming endpoint.
+ *
+ * This keeps your existing provider fallback flow.
+ * The streaming mock behavior is handled separately below.
+ */
 export const createChatResponse = async (
   request: Request<
     Record<string, never>,
@@ -63,61 +256,26 @@ export const createChatResponse = async (
   >,
 ) => {
   try {
-    const {
-      model,
-      messages,
-      knowledgeBaseId,
-      systemPrompt,
-    } = request.body;
-
-    if (!model) {
-      return response.status(400).json({
-        error: {
-          code: "MODEL_REQUIRED",
-          message: "A model provider is required.",
-        },
-      });
-    }
-
-    if (
-      !Array.isArray(messages) ||
-      messages.length === 0
-    ) {
-      return response.status(400).json({
-        error: {
-          code: "MESSAGES_REQUIRED",
-          message:
-            "At least one conversation message is required.",
-        },
-      });
-    }
-
-    if (!knowledgeBaseId) {
-      return response.status(400).json({
-        error: {
-          code: "KNOWLEDGE_BASE_REQUIRED",
-          message:
-            "A knowledge base ID is required.",
-        },
-      });
-    }
-
-    const latestUserMessage = [...messages]
-      .reverse()
-      .find(
-        (message) =>
-          message.role === "user",
+    const validation =
+      validateChatRequest(
+        request.body,
       );
 
-    if (!latestUserMessage) {
-      return response.status(400).json({
-        error: {
-          code: "USER_MESSAGE_REQUIRED",
-          message:
-            "A user message is required.",
-        },
-      });
+    if (!validation.valid) {
+      return response
+        .status(validation.status)
+        .json(validation.error);
     }
+
+    const {
+      model,
+      latestUserMessage,
+    } = validation;
+
+    const {
+      messages,
+      systemPrompt,
+    } = request.body;
 
     const retrievedChunks =
       await retrieveRelevantChunks(
@@ -125,27 +283,79 @@ export const createChatResponse = async (
         6,
       );
 
-    if (retrievedChunks.length === 0) {
-      return response.status(200).json({
-        message:
-          "I couldn't find that information in the product knowledge base.",
-        inputTokens: 0,
-        outputTokens: 0,
-        cost: 0,
-        model,
-        latencyMs: 0,
-        sourceChunks: [],
-      });
+    if (
+      retrievedChunks.length === 0
+    ) {
+      return response
+        .status(200)
+        .json({
+          message:
+            NOT_FOUND_MESSAGE,
+          inputTokens: 0,
+          outputTokens: 0,
+          cost: 0,
+          model,
+          latencyMs: 0,
+          sourceChunks: [],
+        });
     }
 
-      const llmResult =
+    /*
+     * Claude and Gemini use the local mock
+     * response when this non-streaming
+     * endpoint is called.
+     */
+    if (
+      model === "claude" ||
+      model === "gemini"
+    ) {
+      let completeContent = "";
+
+      const mockResult =
+        await streamMockResponse(
+          {
+            provider: model,
+            question:
+              latestUserMessage.content,
+            retrievedContent:
+              buildMockRetrievedContent(
+                retrievedChunks,
+              ),
+          },
+          (textDelta) => {
+            completeContent +=
+              textDelta;
+          },
+        );
+
+      return response
+        .status(200)
+        .json({
+          message:
+            completeContent,
+          inputTokens:
+            mockResult.inputTokens,
+          outputTokens:
+            mockResult.outputTokens,
+          cost: 0,
+          model,
+          latencyMs:
+            mockResult.latencyMs,
+          sourceChunks:
+            mapSourceChunks(
+              retrievedChunks,
+            ),
+        });
+    }
+
+    const llmResult =
       await generateWithFallback(
         model,
         {
           messages,
           systemPrompt:
             systemPrompt?.trim() ||
-            "Answer only using the supplied product documentation. If the answer is not supported by the context, clearly say that it was not found in the knowledge base.",
+            DEFAULT_SYSTEM_PROMPT,
           context:
             buildKnowledgeContext(
               retrievedChunks,
@@ -154,27 +364,21 @@ export const createChatResponse = async (
       );
 
     const result: ChatResponse = {
-      message: llmResult.content,
+      message:
+        llmResult.content,
       inputTokens:
         llmResult.inputTokens,
       outputTokens:
         llmResult.outputTokens,
-      cost: llmResult.cost,
+      cost:
+        llmResult.cost,
       model:
         llmResult.provider,
       latencyMs:
         llmResult.latencyMs,
       sourceChunks:
-        retrievedChunks.map(
-          (chunk) => ({
-            id: chunk.id,
-            source:
-              chunk.source,
-            content:
-              chunk.content,
-            score:
-              chunk.score,
-          }),
+        mapSourceChunks(
+          retrievedChunks,
         ),
     };
 
@@ -192,367 +396,405 @@ export const createChatResponse = async (
         ? error.message
         : "Unknown chat error.";
 
-    return response.status(500).json({
-      error: {
-        code: "CHAT_GENERATION_FAILED",
-        message,
-      },
-    });
+    return response
+      .status(500)
+      .json({
+        error: {
+          code:
+            "CHAT_GENERATION_FAILED",
+          message,
+        },
+      });
   }
 };
 
-export const createTestChatStream = async (
-  request: Request,
-  response: Response,
-): Promise<void> => {
-  response.status(200);
+/*
+ * Simple SSE test endpoint.
+ */
+export const createTestChatStream =
+  async (
+    request: Request,
+    response: Response,
+  ): Promise<void> => {
+    response.status(200);
 
-  response.setHeader(
-    "Content-Type",
-    "text/event-stream",
-  );
-  response.setHeader(
-    "Cache-Control",
-    "no-cache, no-transform",
-  );
-  response.setHeader(
-    "Connection",
-    "keep-alive",
-  );
+    response.setHeader(
+      "Content-Type",
+      "text/event-stream",
+    );
 
-  // Prevent proxies such as Nginx from buffering the response.
-  response.setHeader(
-    "X-Accel-Buffering",
-    "no",
-  );
+    response.setHeader(
+      "Cache-Control",
+      "no-cache, no-transform",
+    );
 
-  // Immediately send the HTTP headers.
-  response.flushHeaders();
+    response.setHeader(
+      "Connection",
+      "keep-alive",
+    );
 
-  const words = [
-    "This",
-    " is",
-    " a",
-    " test",
-    " SSE",
-    " response",
-    " from",
-    " the",
-    " Node",
-    " backend.",
-  ];
+    response.setHeader(
+      "X-Accel-Buffering",
+      "no",
+    );
 
-  let index = 0;
+    response.flushHeaders();
 
-  const interval = setInterval(() => {
-    if (index >= words.length) {
-      response.write(
-        `event: done\ndata: ${JSON.stringify({
-          completed: true,
-        })}\n\n`,
+    const words = [
+      "This",
+      " is",
+      " a",
+      " test",
+      " SSE",
+      " response",
+      " from",
+      " the",
+      " Node",
+      " backend.",
+    ];
+
+    let index = 0;
+
+    const interval =
+      setInterval(() => {
+        if (
+          index >= words.length
+        ) {
+          sendSseEvent(
+            response,
+            "done",
+            {
+              completed: true,
+            },
+          );
+
+          clearInterval(interval);
+          response.end();
+          return;
+        }
+
+        sendSseEvent(
+          response,
+          "delta",
+          {
+            text: words[index],
+          },
+        );
+
+        index += 1;
+      }, 300);
+
+    request.on(
+      "close",
+      () => {
+        clearInterval(interval);
+
+        if (
+          !response.writableEnded
+        ) {
+          response.end();
+        }
+      },
+    );
+  };
+
+/*
+ * Main streaming chat endpoint.
+ *
+ * OpenAI:
+ *   Uses the real OpenAI API.
+ *
+ * Claude and Gemini:
+ *   Use the local mock streaming service.
+ */
+export const createChatStream =
+  async (
+    request: Request<
+      Record<string, never>,
+      unknown,
+      ChatRequest
+    >,
+    response: Response,
+  ): Promise<void> => {
+    const validation =
+      validateChatRequest(
+        request.body,
       );
 
-      clearInterval(interval);
-      response.end();
+    /*
+     * Validate before starting SSE so
+     * errors can be returned as JSON.
+     */
+    if (!validation.valid) {
+      response
+        .status(validation.status)
+        .json(validation.error);
+
       return;
     }
 
-    response.write(
-      `event: delta\ndata: ${JSON.stringify({
-        text: words[index],
-      })}\n\n`,
-    );
+    const {
+      model,
+      latestUserMessage,
+    } = validation;
 
-    index += 1;
-  }, 300);
+    const {
+      messages,
+      systemPrompt,
+    } = request.body;
 
-  request.on("close", () => {
-    clearInterval(interval);
+    const abortController =
+      new AbortController();
 
-    if (!response.writableEnded) {
-      response.end();
-    }
-  });
-};
-
-export const createChatStream = async (
-  request: Request<
-    Record<string, never>,
-    unknown,
-    ChatRequest
-  >,
-  response: Response,
-): Promise<void> => {
-  const {
-    model,
-    messages,
-    knowledgeBaseId,
-    systemPrompt,
-  } = request.body;
-
-  /*
-   * Validate before opening the SSE connection.
-   * This allows us to return normal JSON errors for
-   * invalid requests.
-   */
-  if (!model) {
-    response.status(400).json({
-      error: {
-        code: "MODEL_REQUIRED",
-        message:
-          "A model provider is required.",
-      },
-    });
-
-    return;
-  }
-
-  if (model !== "openai") {
-    response.status(400).json({
-      error: {
-        code:
-          "STREAMING_PROVIDER_NOT_SUPPORTED",
-        message:
-          "Streaming currently supports only the OpenAI provider.",
-      },
-    });
-
-    return;
-  }
-
-  if (
-    !Array.isArray(messages) ||
-    messages.length === 0
-  ) {
-    response.status(400).json({
-      error: {
-        code: "MESSAGES_REQUIRED",
-        message:
-          "At least one conversation message is required.",
-      },
-    });
-
-    return;
-  }
-
-  if (!knowledgeBaseId) {
-    response.status(400).json({
-      error: {
-        code: "KNOWLEDGE_BASE_REQUIRED",
-        message:
-          "A knowledge base ID is required.",
-      },
-    });
-
-    return;
-  }
-
-  const latestUserMessage = [...messages]
-    .reverse()
-    .find(
-      (message) =>
-        message.role === "user",
-    );
-
-  if (!latestUserMessage) {
-    response.status(400).json({
-      error: {
-        code: "USER_MESSAGE_REQUIRED",
-        message:
-          "A user message is required.",
-      },
-    });
-
-    return;
-  }
-
-  /*
-   * The AbortController lets us stop the OpenAI request
-   * if the browser closes the SSE connection.
-   */
-  const abortController =
-    new AbortController();
-
-  response.on("close", () => {
-    if (!response.writableEnded) {
-      abortController.abort();
-    }
-  });
-
-  /*
-   * Open the SSE response.
-   */
-  response.status(200);
-
-  response.setHeader(
-    "Content-Type",
-    "text/event-stream",
-  );
-
-  response.setHeader(
-    "Cache-Control",
-    "no-cache, no-transform",
-  );
-
-  response.setHeader(
-    "Connection",
-    "keep-alive",
-  );
-
-  response.setHeader(
-    "X-Accel-Buffering",
-    "no",
-  );
-
-  response.flushHeaders();
-
-  try {
-    sendSseEvent(
-      response,
-      "status",
-      {
-        stage: "retrieving",
-        message:
-          "Searching the knowledge base...",
+    response.on(
+      "close",
+      () => {
+        if (
+          !response.writableEnded
+        ) {
+          abortController.abort();
+        }
       },
     );
 
-    const retrievedChunks =
-      await retrieveRelevantChunks(
-        latestUserMessage.content,
-        6,
-      );
+    response.status(200);
 
-    if (retrievedChunks.length === 0) {
+    response.setHeader(
+      "Content-Type",
+      "text/event-stream",
+    );
+
+    response.setHeader(
+      "Cache-Control",
+      "no-cache, no-transform",
+    );
+
+    response.setHeader(
+      "Connection",
+      "keep-alive",
+    );
+
+    /*
+     * Prevent Nginx from buffering
+     * token-by-token responses.
+     */
+    response.setHeader(
+      "X-Accel-Buffering",
+      "no",
+    );
+
+    response.flushHeaders();
+
+    try {
       sendSseEvent(
         response,
-        "delta",
+        "status",
         {
-          text:
-            "I couldn't find that information in the product knowledge base.",
+          stage: "retrieving",
+          message:
+            "Searching the knowledge base...",
         },
       );
+
+      const retrievedChunks =
+        await retrieveRelevantChunks(
+          latestUserMessage.content,
+          6,
+        );
+
+      if (
+        retrievedChunks.length === 0
+      ) {
+        sendSseEvent(
+          response,
+          "delta",
+          {
+            text:
+              NOT_FOUND_MESSAGE,
+          },
+        );
+
+        sendSseEvent(
+          response,
+          "done",
+          {
+            message:
+              NOT_FOUND_MESSAGE,
+            inputTokens: 0,
+            outputTokens: 0,
+            cost: 0,
+            model,
+            latencyMs: 0,
+            sourceChunks: [],
+          },
+        );
+
+        response.end();
+        return;
+      }
+
+      sendSseEvent(
+        response,
+        "status",
+        {
+          stage: "generating",
+          message:
+            model === "openai"
+              ? "Generating the answer with OpenAI..."
+              : `Generating a mock ${model} answer...`,
+        },
+      );
+
+      /*
+       * OpenAI uses the actual API.
+       */
+      if (model === "openai") {
+        const streamingResult =
+          await streamOpenAIResponse(
+            {
+              messages,
+              systemPrompt:
+                systemPrompt?.trim() ||
+                DEFAULT_SYSTEM_PROMPT,
+              context:
+                buildKnowledgeContext(
+                  retrievedChunks,
+                ),
+            },
+            (textDelta) => {
+              if (
+                response.writableEnded ||
+                response.destroyed
+              ) {
+                return;
+              }
+
+              sendSseEvent(
+                response,
+                "delta",
+                {
+                  text:
+                    textDelta,
+                },
+              );
+            },
+            abortController.signal,
+          );
+
+        sendSseEvent(
+          response,
+          "done",
+          {
+            message:
+              streamingResult.content,
+            inputTokens:
+              streamingResult.inputTokens,
+            outputTokens:
+              streamingResult.outputTokens,
+            cost: 0,
+            model: "openai",
+            providerMode: "live",
+            providerModel:
+              streamingResult.model,
+            latencyMs:
+              streamingResult.latencyMs,
+            sourceChunks:
+              mapSourceChunks(
+                retrievedChunks,
+              ),
+          },
+        );
+
+        response.end();
+        return;
+      }
+
+      /*
+       * Claude and Gemini are mocked locally.
+       * No Claude or Gemini API keys are needed.
+       */
+      const mockResult =
+        await streamMockResponse(
+          {
+            provider: model,
+            question:
+              latestUserMessage.content,
+            retrievedContent:
+              buildMockRetrievedContent(
+                retrievedChunks,
+              ),
+          },
+          (textDelta) => {
+            if (
+              response.writableEnded ||
+              response.destroyed
+            ) {
+              return;
+            }
+
+            sendSseEvent(
+              response,
+              "delta",
+              {
+                text:
+                  textDelta,
+              },
+            );
+          },
+          abortController.signal,
+        );
 
       sendSseEvent(
         response,
         "done",
         {
           message:
-            "I couldn't find that information in the product knowledge base.",
-          inputTokens: 0,
-          outputTokens: 0,
+            mockResult.content,
+          inputTokens:
+            mockResult.inputTokens,
+          outputTokens:
+            mockResult.outputTokens,
           cost: 0,
           model,
-          latencyMs: 0,
-          sourceChunks: [],
-        },
-      );
-
-      response.end();
-      return;
-    }
-
-    sendSseEvent(
-      response,
-      "status",
-      {
-        stage: "generating",
-        message:
-          "Generating the answer...",
-      },
-    );
-
-    const streamingResult =
-      await streamOpenAIResponse(
-        {
-          messages,
-          systemPrompt:
-            systemPrompt?.trim() ||
-            "Answer only using the supplied product documentation. If the answer is not supported by the context, clearly say that it was not found in the knowledge base.",
-          context:
-            buildKnowledgeContext(
+          providerMode: "mock",
+          providerModel:
+            mockResult.model,
+          latencyMs:
+            mockResult.latencyMs,
+          sourceChunks:
+            mapSourceChunks(
               retrievedChunks,
             ),
         },
-        (textDelta) => {
-          if (
-            response.writableEnded ||
-            response.destroyed
-          ) {
-            return;
-          }
-
-          sendSseEvent(
-            response,
-            "delta",
-            {
-              text: textDelta,
-            },
-          );
-        },
-        abortController.signal,
-      );
-
-    sendSseEvent(
-      response,
-      "done",
-      {
-        message:
-          streamingResult.content,
-        inputTokens:
-          streamingResult.inputTokens,
-        outputTokens:
-          streamingResult.outputTokens,
-
-        /*
-         * We will connect the pricing service
-         * in a later step.
-         */
-        cost: 0,
-
-        model: "openai",
-        latencyMs:
-          streamingResult.latencyMs,
-
-        sourceChunks:
-          retrievedChunks.map(
-            (chunk) => ({
-              id: chunk.id,
-              source: chunk.source,
-              content: chunk.content,
-              score: chunk.score,
-            }),
-          ),
-      },
-    );
-
-    response.end();
-  } catch (error: unknown) {
-    console.error(
-      "Streaming chat request failed:",
-      error,
-    );
-
-    const message =
-      error instanceof Error
-        ? error.message
-        : "Unknown streaming error.";
-
-    if (
-      !response.writableEnded &&
-      !response.destroyed
-    ) {
-      sendSseEvent(
-        response,
-        "error",
-        {
-          code:
-            "CHAT_STREAM_FAILED",
-          message,
-        },
       );
 
       response.end();
+    } catch (error: unknown) {
+      console.error(
+        "Streaming chat request failed:",
+        error,
+      );
+
+      const message =
+        error instanceof Error
+          ? error.message
+          : "Unknown streaming error.";
+
+      if (
+        !response.writableEnded &&
+        !response.destroyed
+      ) {
+        sendSseEvent(
+          response,
+          "error",
+          {
+            code:
+              "CHAT_STREAM_FAILED",
+            message,
+          },
+        );
+
+        response.end();
+      }
     }
-  }
-};
+  };
