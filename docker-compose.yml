@@ -8,14 +8,14 @@ services:
       - ./chroma-data:/data
     restart: unless-stopped
 
-  backend:
+  chatbot-service:
     build:
-      context: ./backend
-    container_name: enterprise-chatbot-backend
+      context: ./chatbot-service
+    container_name: enterprise-chatbot-service
     ports:
       - "3001:3001"
     env_file:
-      - ./backend/.env
+      - ./chatbot-service/.env
     environment:
       PORT: 3001
       FRONTEND_URL: http://localhost:8080
@@ -35,5 +35,5 @@ services:
     ports:
       - "8080:80"
     depends_on:
-      - backend
+      - chatbot-service
     restart: unless-stopped
