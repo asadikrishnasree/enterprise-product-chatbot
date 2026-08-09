@@ -1,49 +1,45 @@
 import type {
-    ModelProvider,
-  } from "../../types/chat.js";
-  
-  import type {
-    LlmProvider,
-  } from "./llmProvider.js";
-  
-  import {
-    OpenAIProvider,
-  } from "./providers/openAIProvider.js";
-  
-  import {
-    MockClaudeProvider,
-  } from "./providers/mockClaudeProvider.js";
+  ModelProvider,
+} from "../../types/chat.js";
 
-  import {
-    MockGeminiProvider,
-  } from "./providers/mockGeminiProvider.js";
+import type {
+  LlmProvider,
+} from "./llmProvider.js";
 
-  const unsupportedProviderError = (
-    provider: ModelProvider,
-  ): Error =>
-    new Error(
-      `The ${provider} provider has not been configured yet.`,
-    );
-  
-  export const getLlmProvider = (
-    provider: ModelProvider,
-  ): LlmProvider => {
-    switch (provider) {
-      case "openai":
-        return new OpenAIProvider();
-  
-        case "claude":
-          return new MockClaudeProvider();
+import {
+  OpenAIProvider,
+} from "./providers/openAIProvider.js";
 
-        case "gemini":
-          return new MockGeminiProvider();
-  
-      default: {
-        const exhaustiveCheck: never = provider;
-  
-        throw new Error(
-          `Unsupported provider: ${String(exhaustiveCheck)}`,
-        );
-      }
+import {
+  ClaudeProvider,
+} from "./providers/claudeProvider.js";
+
+import {
+  GeminiProvider,
+} from "./providers/geminiProvider.js";
+
+export const getLlmProvider = (
+  provider: ModelProvider,
+): LlmProvider => {
+  switch (provider) {
+    case "openai":
+      return new OpenAIProvider();
+
+    case "claude":
+      return new ClaudeProvider();
+
+    case "gemini":
+      return new GeminiProvider();
+
+    default: {
+      const exhaustiveCheck: never =
+        provider;
+
+      throw new Error(
+        `Unsupported provider: ${String(
+          exhaustiveCheck,
+        )}`,
+      );
     }
-  };
+  }
+};

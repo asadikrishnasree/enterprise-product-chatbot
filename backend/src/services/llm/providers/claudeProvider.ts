@@ -1,50 +1,26 @@
 import Anthropic from "@anthropic-ai/sdk";
 
 import type {
-  LlmProvider,
-} from "../llmProvider.js";
-
-import type {
   LlmGenerationRequest,
   LlmGenerationResult,
 } from "../types.js";
 
-const DEFAULT_CLAUDE_MODEL =
-  "claude-sonnet-5";
+import type {
+  LlmProvider,
+} from "../llmProvider.js";
 
-const buildKnowledgePrompt = (
-  request: LlmGenerationRequest,
-): string => {
-  const conversation = request.messages
-    .filter((message) => message.role !== "system")
-    .map(
-      (message) =>
-        `${message.role.toUpperCase()}: ${message.content}`,
-    )
-    .join("\n\n");
-
-  return [
-    "KNOWLEDGE-BASE CONTEXT:",
-    request.context,
-    "",
-    "CONVERSATION:",
-    conversation,
-    "",
-    "Answer the latest user question using only the supplied knowledge-base context.",
-    "If the answer is not present in the context, clearly say that it was not found in the knowledge base.",
-  ].join("\n");
-};
+const CLAUDE_MODEL =
+  process.env.CLAUDE_MODEL?.trim() ||
+  "claude-sonnet-4-6";
 
 export class ClaudeProvider implements LlmProvider {
   readonly provider = "claude" as const;
 
-  private readonly client: Anthropic;
-
-  private readonly model: string;
-
-  constructor() {
+  async generate(
+    request: LlmGenerationRequest,
+  ): Promise<LlmGenerationResult> {
     const apiKey =
-      process.env.ANTHROPIC_API_KEY;
+      process.env.ANTHROPIC_API_KEY?.trim();
 
     if (!apiKey) {
       throw new Error(
@@ -52,32 +28,50 @@ export class ClaudeProvider implements LlmProvider {
       );
     }
 
-    this.client = new Anthropic({
+    const client = new Anthropic({
       apiKey,
     });
 
-    this.model =
-      process.env.ANTHROPIC_MODEL?.trim() ||
-      DEFAULT_CLAUDE_MODEL;
-  }
+    const startedAt = Date.now();
 
-  async generate(
-    request: LlmGenerationRequest,
-  ): Promise<LlmGenerationResult> {
-    const startedAt = performance.now();
+    const system = [
+      request.systemPrompt,
+      "",
+      "PRODUCT KNOWLEDGE CONTEXT:",
+      request.context,
+      "",
+      "IMPORTANT:",
+      "Answer using only the product knowledge context above.",
+      "If the context does not contain enough information to answer the question, clearly say that the information was not found in the product knowledge base.",
+      "Do not invent product features, pricing, support commitments, integrations, or version information.",
+    ].join("\n");
+
+    const messages: Anthropic.MessageParam[] =
+      request.messages
+        .filter(
+          (message) =>
+            message.role === "user" ||
+            message.role === "assistant",
+        )
+        .map((message) => ({
+          role: message.role as
+            | "user"
+            | "assistant",
+          content: message.content,
+        }));
+
+    if (messages.length === 0) {
+      throw new Error(
+        "Claude request contains no user or assistant messages.",
+      );
+    }
 
     const response =
-      await this.client.messages.create({
-        model: this.model,
-        max_tokens: 1024,
-        system: request.systemPrompt,
-        messages: [
-          {
-            role: "user",
-            content:
-              buildKnowledgePrompt(request),
-          },
-        ],
+      await client.messages.create({
+        model: CLAUDE_MODEL,
+        max_tokens: 1200,
+        system,
+        messages,
       });
 
     const content = response.content
@@ -91,32 +85,29 @@ export class ClaudeProvider implements LlmProvider {
       .join("\n")
       .trim();
 
-    if (!content) {
-      throw new Error(
-        "Claude returned an empty response.",
-      );
-    }
-
     const inputTokens =
-      response.usage.input_tokens;
+      response.usage.input_tokens ?? 0;
 
     const outputTokens =
-      response.usage.output_tokens;
+      response.usage.output_tokens ?? 0;
 
     return {
-      content,
+      content:
+        content ||
+        "Claude returned an empty response.",
+
       provider: this.provider,
-      model: this.model,
+
+      model: CLAUDE_MODEL,
+
       inputTokens,
+
       outputTokens,
 
-      // Claude pricing will be added to
-      // pricingService in a later step.
       cost: 0,
 
-      latencyMs: Math.round(
-        performance.now() - startedAt,
-      ),
+      latencyMs:
+        Date.now() - startedAt,
     };
   }
 }

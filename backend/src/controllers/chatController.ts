@@ -15,16 +15,15 @@ import {
   streamOpenAIResponse,
 } from "../services/llm/streaming/openAIStreamingService.js";
 
-import {
-  streamMockResponse,
-} from "../services/llm/streaming/mockStreamingService.js";
-
 import type {
   ChatRequest,
   ChatResponse,
   ModelProvider,
 } from "../types/chat.js";
 
+/*
+ * Error response returned by the API.
+ */
 type ChatErrorResponse = {
   error: {
     code: string;
@@ -32,24 +31,43 @@ type ChatErrorResponse = {
   };
 };
 
+/*
+ * Infer the type returned by retrieveRelevantChunks()
+ * instead of duplicating the chunk interface here.
+ */
 type RetrievedChunks = Awaited<
   ReturnType<typeof retrieveRelevantChunks>
 >;
 
+/*
+ * Default system prompt used when the frontend
+ * does not provide one.
+ *
+ * This is important for RAG because we want the
+ * model to stay grounded in retrieved documentation.
+ */
 const DEFAULT_SYSTEM_PROMPT =
   "Answer only using the supplied product documentation. " +
   "If the answer is not supported by the context, clearly say " +
-  "that it was not found in the knowledge base.";
+  "that it was not found in the knowledge base. " +
+  "Do not invent product features, pricing, integrations, " +
+  "support commitments, or version information.";
 
 const NOT_FOUND_MESSAGE =
   "I couldn't find that information in the product knowledge base.";
 
+/*
+ * Models supported by the application.
+ */
 const supportedProviders: ModelProvider[] = [
   "openai",
   "claude",
   "gemini",
 ];
 
+/*
+ * Runtime provider validation.
+ */
 const isSupportedProvider = (
   provider: unknown,
 ): provider is ModelProvider =>
@@ -58,6 +76,15 @@ const isSupportedProvider = (
     provider as ModelProvider,
   );
 
+/*
+ * Helper for writing Server-Sent Events.
+ *
+ * Each SSE event looks like:
+ *
+ * event: delta
+ * data: {"text":"hello"}
+ *
+ */
 const sendSseEvent = (
   response: Response,
   eventName: string,
@@ -69,6 +96,10 @@ const sendSseEvent = (
   );
 };
 
+/*
+ * Convert the Chroma retrieval results into
+ * readable RAG context for the LLM.
+ */
 const buildKnowledgeContext = (
   chunks: RetrievedChunks,
 ): string =>
@@ -84,30 +115,10 @@ const buildKnowledgeContext = (
     )
     .join("\n\n---\n\n");
 
-const buildMockRetrievedContent = (
-  chunks: RetrievedChunks,
-): string =>
-  chunks
-    .slice(0, 3)
-    .map(
-      (chunk, index) =>
-        [
-          `Source ${index + 1}: ${chunk.source}`,
-          chunk.section
-            ? `Section: ${chunk.section}`
-            : null,
-          chunk.content,
-        ]
-          .filter(
-            (
-              value,
-            ): value is string =>
-              Boolean(value),
-          )
-          .join("\n"),
-    )
-    .join("\n\n");
-
+/*
+ * Convert internal retrieval chunks into the
+ * smaller source structure returned to the UI.
+ */
 const mapSourceChunks = (
   chunks: RetrievedChunks,
 ) =>
@@ -118,6 +129,17 @@ const mapSourceChunks = (
     score: chunk.score,
   }));
 
+/*
+ * Find the most recent user message.
+ *
+ * A conversation could look like:
+ *
+ * user
+ * assistant
+ * user
+ *
+ * We want the final user question for retrieval.
+ */
 const findLatestUserMessage = (
   messages: ChatRequest["messages"],
 ) =>
@@ -128,6 +150,15 @@ const findLatestUserMessage = (
         message.role === "user",
     );
 
+/*
+ * Shared validation used by both:
+ *
+ * POST /api/chat
+ *
+ * and
+ *
+ * POST /api/chat/stream
+ */
 const validateChatRequest = (
   requestBody: ChatRequest,
 ):
@@ -150,6 +181,9 @@ const validateChatRequest = (
     knowledgeBaseId,
   } = requestBody;
 
+  /*
+   * Model must be supplied.
+   */
   if (!model) {
     return {
       valid: false,
@@ -164,6 +198,10 @@ const validateChatRequest = (
     };
   }
 
+  /*
+   * Only OpenAI, Claude and Gemini
+   * are supported.
+   */
   if (!isSupportedProvider(model)) {
     return {
       valid: false,
@@ -178,6 +216,10 @@ const validateChatRequest = (
     };
   }
 
+  /*
+   * Conversation must contain at least
+   * one message.
+   */
   if (
     !Array.isArray(messages) ||
     messages.length === 0
@@ -195,6 +237,9 @@ const validateChatRequest = (
     };
   }
 
+  /*
+   * Require a knowledge-base identifier.
+   */
   if (!knowledgeBaseId) {
     return {
       valid: false,
@@ -210,6 +255,10 @@ const validateChatRequest = (
     };
   }
 
+  /*
+   * Retrieval requires an actual user
+   * question.
+   */
   const latestUserMessage =
     findLatestUserMessage(messages);
 
@@ -240,10 +289,20 @@ const validateChatRequest = (
 };
 
 /*
- * Non-streaming endpoint.
+ * ============================================================
+ * NON-STREAMING CHAT
+ * ============================================================
  *
- * This keeps your existing provider fallback flow.
- * The streaming mock behavior is handled separately below.
+ * POST /api/chat
+ *
+ * Used for normal request/response generation.
+ *
+ * All three providers now use the real provider layer:
+ *
+ * OpenAI
+ * Claude
+ * Gemini
+ *
  */
 export const createChatResponse = async (
   request: Request<
@@ -256,6 +315,9 @@ export const createChatResponse = async (
   >,
 ) => {
   try {
+    /*
+     * Validate incoming request.
+     */
     const validation =
       validateChatRequest(
         request.body,
@@ -277,12 +339,22 @@ export const createChatResponse = async (
       systemPrompt,
     } = request.body;
 
+    /*
+     * ========================================================
+     * STEP 1
+     * Retrieve relevant knowledge-base chunks from ChromaDB.
+     * ========================================================
+     */
     const retrievedChunks =
       await retrieveRelevantChunks(
         latestUserMessage.content,
         6,
       );
 
+    /*
+     * If Chroma returned no documents,
+     * do not call an LLM.
+     */
     if (
       retrievedChunks.length === 0
     ) {
@@ -291,71 +363,48 @@ export const createChatResponse = async (
         .json({
           message:
             NOT_FOUND_MESSAGE,
+
           inputTokens: 0,
+
           outputTokens: 0,
+
           cost: 0,
+
           model,
+
           latencyMs: 0,
+
           sourceChunks: [],
         });
     }
 
     /*
-     * Claude and Gemini use the local mock
-     * response when this non-streaming
-     * endpoint is called.
+     * ========================================================
+     * STEP 2
+     * Generate response through our provider abstraction.
+     *
+     * model = openai
+     *      -> OpenAIProvider
+     *
+     * model = claude
+     *      -> ClaudeProvider
+     *
+     * model = gemini
+     *      -> GeminiProvider
+     *
+     * generateWithFallback() handles provider failures.
+     * ========================================================
      */
-    if (
-      model === "claude" ||
-      model === "gemini"
-    ) {
-      let completeContent = "";
-
-      const mockResult =
-        await streamMockResponse(
-          {
-            provider: model,
-            question:
-              latestUserMessage.content,
-            retrievedContent:
-              buildMockRetrievedContent(
-                retrievedChunks,
-              ),
-          },
-          (textDelta) => {
-            completeContent +=
-              textDelta;
-          },
-        );
-
-      return response
-        .status(200)
-        .json({
-          message:
-            completeContent,
-          inputTokens:
-            mockResult.inputTokens,
-          outputTokens:
-            mockResult.outputTokens,
-          cost: 0,
-          model,
-          latencyMs:
-            mockResult.latencyMs,
-          sourceChunks:
-            mapSourceChunks(
-              retrievedChunks,
-            ),
-        });
-    }
-
     const llmResult =
       await generateWithFallback(
         model,
         {
           messages,
+
           systemPrompt:
             systemPrompt?.trim() ||
             DEFAULT_SYSTEM_PROMPT,
+
           context:
             buildKnowledgeContext(
               retrievedChunks,
@@ -363,19 +412,37 @@ export const createChatResponse = async (
         },
       );
 
+    /*
+     * ========================================================
+     * STEP 3
+     * Map provider response into API response.
+     * ========================================================
+     */
     const result: ChatResponse = {
       message:
         llmResult.content,
+
       inputTokens:
         llmResult.inputTokens,
+
       outputTokens:
         llmResult.outputTokens,
+
       cost:
         llmResult.cost,
+
+      /*
+       * Important:
+       *
+       * generateWithFallback() might use a different provider
+       * if the requested provider failed.
+       */
       model:
         llmResult.provider,
+
       latencyMs:
         llmResult.latencyMs,
+
       sourceChunks:
         mapSourceChunks(
           retrievedChunks,
@@ -402,6 +469,7 @@ export const createChatResponse = async (
         error: {
           code:
             "CHAT_GENERATION_FAILED",
+
           message,
         },
       });
@@ -409,7 +477,23 @@ export const createChatResponse = async (
 };
 
 /*
- * Simple SSE test endpoint.
+ * ============================================================
+ * SIMPLE SSE TEST
+ * ============================================================
+ *
+ * GET /api/chat/stream/test
+ *
+ * This does not call an LLM.
+ *
+ * It exists only to verify that:
+ *
+ * Express
+ *      ↓
+ * SSE
+ *      ↓
+ * browser/curl
+ *
+ * works correctly.
  */
 export const createTestChatStream =
   async (
@@ -457,6 +541,9 @@ export const createTestChatStream =
 
     const interval =
       setInterval(() => {
+        /*
+         * Finished sending test words.
+         */
         if (
           index >= words.length
         ) {
@@ -469,10 +556,15 @@ export const createTestChatStream =
           );
 
           clearInterval(interval);
+
           response.end();
+
           return;
         }
 
+        /*
+         * Send one small piece of text.
+         */
         sendSseEvent(
           response,
           "delta",
@@ -484,6 +576,9 @@ export const createTestChatStream =
         index += 1;
       }, 300);
 
+    /*
+     * Browser/user disconnected.
+     */
     request.on(
       "close",
       () => {
@@ -499,13 +594,28 @@ export const createTestChatStream =
   };
 
 /*
- * Main streaming chat endpoint.
+ * ============================================================
+ * MAIN STREAMING CHAT
+ * ============================================================
  *
- * OpenAI:
- *   Uses the real OpenAI API.
+ * POST /api/chat/stream
  *
- * Claude and Gemini:
- *   Use the local mock streaming service.
+ * Current behavior:
+ *
+ * OpenAI
+ *   -> real OpenAI API
+ *   -> real token/text-delta streaming
+ *
+ * Claude
+ *   -> real Anthropic API
+ *   -> complete answer returned as one SSE delta
+ *
+ * Gemini
+ *   -> real Gemini API
+ *   -> complete answer returned as one SSE delta
+ *
+ * Later we can implement native Claude and Gemini
+ * streaming as separate streaming services.
  */
 export const createChatStream =
   async (
@@ -516,15 +626,17 @@ export const createChatStream =
     >,
     response: Response,
   ): Promise<void> => {
+    /*
+     * Validate BEFORE opening the SSE stream.
+     *
+     * Once we start SSE headers, we cannot easily
+     * switch back to a normal JSON error response.
+     */
     const validation =
       validateChatRequest(
         request.body,
       );
 
-    /*
-     * Validate before starting SSE so
-     * errors can be returned as JSON.
-     */
     if (!validation.valid) {
       response
         .status(validation.status)
@@ -543,6 +655,10 @@ export const createChatStream =
       systemPrompt,
     } = request.body;
 
+    /*
+     * Allows us to cancel OpenAI generation
+     * when the client disconnects.
+     */
     const abortController =
       new AbortController();
 
@@ -557,6 +673,9 @@ export const createChatStream =
       },
     );
 
+    /*
+     * Open SSE response.
+     */
     response.status(200);
 
     response.setHeader(
@@ -575,8 +694,7 @@ export const createChatStream =
     );
 
     /*
-     * Prevent Nginx from buffering
-     * token-by-token responses.
+     * Prevent Nginx from buffering the stream.
      */
     response.setHeader(
       "X-Accel-Buffering",
@@ -586,22 +704,38 @@ export const createChatStream =
     response.flushHeaders();
 
     try {
+      /*
+       * ======================================================
+       * STEP 1
+       * Tell the frontend retrieval has started.
+       * ======================================================
+       */
       sendSseEvent(
         response,
         "status",
         {
           stage: "retrieving",
+
           message:
             "Searching the knowledge base...",
         },
       );
 
+      /*
+       * ======================================================
+       * STEP 2
+       * Retrieve relevant ChromaDB chunks.
+       * ======================================================
+       */
       const retrievedChunks =
         await retrieveRelevantChunks(
           latestUserMessage.content,
           6,
         );
 
+      /*
+       * No documents found.
+       */
       if (
         retrievedChunks.length === 0
       ) {
@@ -620,48 +754,82 @@ export const createChatStream =
           {
             message:
               NOT_FOUND_MESSAGE,
+
             inputTokens: 0,
+
             outputTokens: 0,
+
             cost: 0,
+
             model,
+
             latencyMs: 0,
+
             sourceChunks: [],
           },
         );
 
         response.end();
+
         return;
       }
+
+      /*
+       * ======================================================
+       * STEP 3
+       * Notify frontend that LLM generation is starting.
+       * ======================================================
+       */
+      const providerDisplayName =
+        model === "openai"
+          ? "OpenAI"
+          : model === "claude"
+            ? "Claude"
+            : "Gemini";
 
       sendSseEvent(
         response,
         "status",
         {
           stage: "generating",
+
           message:
-            model === "openai"
-              ? "Generating the answer with OpenAI..."
-              : `Generating a mock ${model} answer...`,
+            `Generating the answer with ${providerDisplayName}...`,
         },
       );
 
       /*
-       * OpenAI uses the actual API.
+       * ======================================================
+       * OPENAI
+       * ======================================================
+       *
+       * OpenAI already has a real streaming service
+       * in this project.
        */
       if (model === "openai") {
         const streamingResult =
           await streamOpenAIResponse(
             {
               messages,
+
               systemPrompt:
                 systemPrompt?.trim() ||
                 DEFAULT_SYSTEM_PROMPT,
+
               context:
                 buildKnowledgeContext(
                   retrievedChunks,
                 ),
             },
+
+            /*
+             * Called every time OpenAI produces
+             * another text delta.
+             */
             (textDelta) => {
+              /*
+               * Client may already have disconnected.
+               */
               if (
                 response.writableEnded ||
                 response.destroyed
@@ -678,89 +846,160 @@ export const createChatStream =
                 },
               );
             },
+
             abortController.signal,
           );
 
-        sendSseEvent(
-          response,
-          "done",
-          {
-            message:
-              streamingResult.content,
-            inputTokens:
-              streamingResult.inputTokens,
-            outputTokens:
-              streamingResult.outputTokens,
-            cost: 0,
-            model: "openai",
-            providerMode: "live",
-            providerModel:
-              streamingResult.model,
-            latencyMs:
-              streamingResult.latencyMs,
-            sourceChunks:
-              mapSourceChunks(
-                retrievedChunks,
-              ),
-          },
-        );
+        /*
+         * Final event carries metadata,
+         * token usage and source chunks.
+         */
+        if (
+          !response.writableEnded &&
+          !response.destroyed
+        ) {
+          sendSseEvent(
+            response,
+            "done",
+            {
+              message:
+                streamingResult.content,
 
-        response.end();
+              inputTokens:
+                streamingResult.inputTokens,
+
+              outputTokens:
+                streamingResult.outputTokens,
+
+              /*
+               * Your current OpenAI streaming service
+               * does not yet calculate price.
+               */
+              cost: 0,
+
+              model: "openai",
+
+              providerMode: "live",
+
+              providerModel:
+                streamingResult.model,
+
+              latencyMs:
+                streamingResult.latencyMs,
+
+              sourceChunks:
+                mapSourceChunks(
+                  retrievedChunks,
+                ),
+            },
+          );
+
+          response.end();
+        }
+
         return;
       }
 
       /*
-       * Claude and Gemini are mocked locally.
-       * No Claude or Gemini API keys are needed.
+       * ======================================================
+       * CLAUDE / GEMINI
+       * ======================================================
+       *
+       * These are now REAL API providers.
+       *
+       * They currently use the non-streaming generate()
+       * interface.
+       *
+       * We still use the SSE connection expected by the
+       * frontend, but send the complete generated answer
+       * as one delta.
+       *
+       * Later:
+       *
+       * Claude -> native Anthropic streaming
+       * Gemini -> native Gemini streaming
        */
-      const mockResult =
-        await streamMockResponse(
+      const llmResult =
+        await generateWithFallback(
+          model,
           {
-            provider: model,
-            question:
-              latestUserMessage.content,
-            retrievedContent:
-              buildMockRetrievedContent(
+            messages,
+
+            systemPrompt:
+              systemPrompt?.trim() ||
+              DEFAULT_SYSTEM_PROMPT,
+
+            context:
+              buildKnowledgeContext(
                 retrievedChunks,
               ),
           },
-          (textDelta) => {
-            if (
-              response.writableEnded ||
-              response.destroyed
-            ) {
-              return;
-            }
-
-            sendSseEvent(
-              response,
-              "delta",
-              {
-                text:
-                  textDelta,
-              },
-            );
-          },
-          abortController.signal,
         );
 
+      /*
+       * Client could disconnect while we were
+       * waiting for Claude/Gemini.
+       */
+      if (
+        response.writableEnded ||
+        response.destroyed
+      ) {
+        return;
+      }
+
+      /*
+       * Send complete real model response.
+       *
+       * Because Claude/Gemini native streaming
+       * isn't implemented yet, this arrives as
+       * one SSE delta rather than many deltas.
+       */
+      sendSseEvent(
+        response,
+        "delta",
+        {
+          text:
+            llmResult.content,
+        },
+      );
+
+      /*
+       * Send metadata.
+       */
       sendSseEvent(
         response,
         "done",
         {
           message:
-            mockResult.content,
+            llmResult.content,
+
           inputTokens:
-            mockResult.inputTokens,
+            llmResult.inputTokens,
+
           outputTokens:
-            mockResult.outputTokens,
-          cost: 0,
-          model,
-          providerMode: "mock",
+            llmResult.outputTokens,
+
+          cost:
+            llmResult.cost,
+
+          /*
+           * Important for fallback:
+           *
+           * The provider that actually generated
+           * the response may differ from the one
+           * originally requested.
+           */
+          model:
+            llmResult.provider,
+
+          providerMode: "live",
+
           providerModel:
-            mockResult.model,
+            llmResult.model,
+
           latencyMs:
-            mockResult.latencyMs,
+            llmResult.latencyMs,
+
           sourceChunks:
             mapSourceChunks(
               retrievedChunks,
@@ -780,6 +1019,10 @@ export const createChatStream =
           ? error.message
           : "Unknown streaming error.";
 
+      /*
+       * If SSE connection is still alive,
+       * send the error through the stream.
+       */
       if (
         !response.writableEnded &&
         !response.destroyed
@@ -790,6 +1033,7 @@ export const createChatStream =
           {
             code:
               "CHAT_STREAM_FAILED",
+
             message,
           },
         );
