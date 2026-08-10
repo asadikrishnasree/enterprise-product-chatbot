@@ -23,7 +23,7 @@ import {
    */
   export class GeminiProvider implements LlmProvider {
     
-    readonly provider = "claude" as const;
+    readonly provider = "gemini" as const;
 
     async generate(
       request: LlmGenerationRequest,
